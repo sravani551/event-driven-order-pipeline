@@ -32,8 +32,18 @@ def call(method: str, path: str, body: dict | None = None, headers: dict | None 
 def dlq_count() -> int:
     """Messages parked in the email DLQ (read via rabbitmqctl inside the compose service)."""
     try:
-        cmd = ["docker", "compose", "exec", "-T", "rabbitmq",
-               "rabbitmqctl", "-q", "list_queues", "name", "messages"]
+        cmd = [
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "rabbitmq",
+            "rabbitmqctl",
+            "-q",
+            "list_queues",
+            "name",
+            "messages",
+        ]
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=True).stdout
     except (OSError, subprocess.SubprocessError):
         return 0
