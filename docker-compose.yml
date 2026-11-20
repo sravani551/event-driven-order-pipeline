@@ -1,0 +1,99 @@
+x-app: &app
+  build: .
+  image: mq-order-pipeline:latest
+  restart: unless-stopped
+  environment:
+    DATABASE_URL: postgresql+psycopg://app:app@postgres:5432/orders
+    KAFKA_BOOTSTRAP: kafka:9092
+    RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+    NOTIFICATION_FAIL_RATE: ${NOTIFICATION_FAIL_RATE:-0.2}
+    RETRY_DELAYS_MS: ${RETRY_DELAYS_MS:-5000,30000,120000}
+  depends_on:
+    bootstrap:
+      condition: service_completed_successfully
+
+services:
+  # ---------- infrastructure ----------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: orders
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d orders"]
+      interval: 3s
+      retries: 20
+
+  kafka:
+    image: apache/kafka:3.9.1
+    ports: ["29092:29092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller           # KRaft mode, no ZooKeeper
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"         # topics are created explicitly by bootstrap
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null"]
+      interval: 5s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports: ["5672:5672", "15672:15672"]                # management UI: http://localhost:15672 (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      retries: 30
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    ports: ["8080:8080"]                               # http://localhost:8080
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    profiles: ["ui"]
+
+  # ---------- application ----------
+  bootstrap:
+    <<: *app
+    restart: "no"
+    command: ["python", "-m", "app.bootstrap"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+
+  api:
+    <<: *app
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["8000:8000"]                               # docs: http://localhost:8000/docs
+
+  outbox-relay:
+    <<: *app
+    command: ["python", "-m", "app.outbox_relay"]
+
+  inventory:
+    <<: *app
+    command: ["python", "-m", "app.inventory_service"]
+
+  status-updater:
+    <<: *app
+    command: ["python", "-m", "app.status_updater"]
+
+  notifier:
+    <<: *app
+    command: ["python", "-m", "app.notification_worker"]
