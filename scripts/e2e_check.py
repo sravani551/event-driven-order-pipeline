@@ -5,10 +5,11 @@ Asserts that:
   * an over-stock order is REJECTED with a reason,
   * stock never goes negative,
   * a retried request with the same Idempotency-Key does not create a second order,
-  * every settled order produced exactly one handled email task.
+  * every settled order's email is accounted for (sent or dead-lettered).
 """
 
 import json
+import subprocess
 import sys
 import time
 import urllib.request
@@ -26,6 +27,22 @@ def call(method: str, path: str, body: dict | None = None, headers: dict | None 
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.load(resp)
+
+
+def dlq_count() -> int:
+    """Messages parked in the email DLQ (read via rabbitmqctl inside the compose service)."""
+    try:
+        out = subprocess.run(
+            ["docker", "compose", "exec", "-T", "rabbitmq", "rabbitmqctl", "-q", "list_queues", "name", "messages"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "notifications.email.dlq":
+            return int(parts[1])
+    return 0
 
 
 def wait_for_api(timeout: float = 240) -> None:
@@ -86,15 +103,19 @@ def main() -> None:
     assert "insufficient stock" in orders[too_many["id"]]["status_reason"]
     assert all(p["stock"] >= 0 for p in call("GET", "/products"))
 
-    # Emails are retried with delays; give the worker time to drain (CI uses short delays).
+    # Every email must be accounted for: sent, or dead-lettered after exhausting its retries
+    # (with a simulated failure rate, a few may legitimately end up in the DLQ).
     deadline = time.time() + 120
     while time.time() < deadline:
         stats = call("GET", "/stats")
-        if stats["processed_by_consumer"].get("notification-worker", 0) >= len(orders):
+        sent = stats["processed_by_consumer"].get("notification-worker", 0)
+        parked = dlq_count()
+        if sent + parked >= len(orders):
             break
-        time.sleep(1)
+        time.sleep(2)
     print(json.dumps(stats, indent=2))
-    assert stats["processed_by_consumer"].get("notification-worker", 0) >= len(orders), "emails missing"
+    print(f"emails sent={sent} dead-lettered={parked} expected={len(orders)}")
+    assert sent + parked >= len(orders), "emails missing"
     print("E2E OK")
 
 
